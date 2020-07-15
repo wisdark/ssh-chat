@@ -138,9 +138,7 @@ func (m PublicMsg) String() string {
 	return fmt.Sprintf("%s: %s", m.from.Name(), m.body)
 }
 
-// EmoteMsg is a /me message sent to the room. It specifically does not
-// extend PublicMsg because it doesn't implement MessageFrom to allow the
-// sender to see the emote.
+// EmoteMsg is a /me message sent to the room.
 type EmoteMsg struct {
 	Msg
 	from *User
@@ -154,6 +152,10 @@ func NewEmoteMsg(body string, from *User) *EmoteMsg {
 		},
 		from: from,
 	}
+}
+
+func (m EmoteMsg) From() *User {
+	return m.from
 }
 
 func (m EmoteMsg) Render(t *Theme) string {
@@ -179,6 +181,10 @@ func NewPrivateMsg(body string, from *User, to *User) PrivateMsg {
 
 func (m PrivateMsg) To() *User {
 	return m.to
+}
+
+func (m PrivateMsg) From() *User {
+	return m.from
 }
 
 func (m PrivateMsg) Render(t *Theme) string {
