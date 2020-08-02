@@ -5,6 +5,7 @@ package chat
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -189,6 +190,7 @@ func InitCommands(c *Commands) {
 			}
 
 			names := room.Members.ListPrefix("")
+			sort.Slice(names, func(i, j int) bool { return names[i].Key() < names[j].Key() })
 			colNames := make([]string, len(names))
 			for i, uname := range names {
 				colNames[i] = colorize(uname.Value().(*Member).User)
