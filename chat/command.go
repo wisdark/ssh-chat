@@ -458,4 +458,70 @@ func InitCommands(c *Commands) {
 			return nil
 		},
 	})
+
+	c.Add(Command{
+		Prefix:     "/away",
+		PrefixHelp: "[REASON]",
+		Help:       "Set away reason, or empty to unset.",
+		Handler: func(room *Room, msg message.CommandMsg) error {
+			awayMsg := strings.TrimSpace(strings.TrimLeft(msg.Body(), "/away"))
+			isAway, _, _ := msg.From().GetAway()
+			msg.From().SetAway(awayMsg)
+			if awayMsg != "" {
+				room.Send(message.NewEmoteMsg("has gone away: "+awayMsg, msg.From()))
+			} else if !isAway {
+				room.Send(message.NewSystemMsg("Not away. Append a reason message to set away.", msg.From()))
+			} else {
+				room.Send(message.NewEmoteMsg("is back.", msg.From()))
+			}
+			return nil
+		},
+	})
+
+	c.Add(Command{
+		Prefix: "/back",
+		Help:   "Clear away status.",
+		Handler: func(room *Room, msg message.CommandMsg) error {
+			isAway, _, _ := msg.From().GetAway()
+			if isAway {
+				msg.From().SetAway("")
+				room.Send(message.NewEmoteMsg("is back.", msg.From()))
+			}
+			return nil
+		},
+	})
+
+	c.Add(Command{
+		Op:         true,
+		Prefix:     "/mute",
+		PrefixHelp: "USER",
+		Help:       "Toggle muting USER, preventing messages from broadcasting.",
+		Handler: func(room *Room, msg message.CommandMsg) error {
+			if !room.IsOp(msg.From()) {
+				return errors.New("must be op")
+			}
+
+			args := msg.Args()
+			if len(args) == 0 {
+				return errors.New("must specify user")
+			}
+
+			member, ok := room.MemberByID(args[0])
+			if !ok {
+				return errors.New("user not found")
+			}
+
+			setMute := !member.IsMuted()
+			member.SetMute(setMute)
+			id := member.ID()
+
+			if setMute {
+				room.Send(message.NewSystemMsg("Muted: "+id, msg.From()))
+			} else {
+				room.Send(message.NewSystemMsg("Unmuted: "+id, msg.From()))
+			}
+
+			return nil
+		},
+	})
 }

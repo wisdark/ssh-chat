@@ -33,10 +33,12 @@ type User struct {
 	screen    io.WriteCloser
 	closeOnce sync.Once
 
-	mu      sync.Mutex
-	config  UserConfig
-	replyTo *User     // Set when user gets a /msg, for replying.
-	lastMsg time.Time // When the last message was rendered
+	mu         sync.Mutex
+	config     UserConfig
+	replyTo    *User     // Set when user gets a /msg, for replying.
+	lastMsg    time.Time // When the last message was rendered.
+	awayReason string    // Away reason, "" when not away.
+	awaySince  time.Time // When away was set, 0 when not away.
 }
 
 func NewUser(identity Identifier) *User {
@@ -69,6 +71,26 @@ func (u *User) LastMsg() time.Time {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.lastMsg
+}
+
+// SetAway sets the users away reason and state.
+func (u *User) SetAway(msg string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.awayReason = msg
+	if msg == "" {
+		u.awaySince = time.Time{}
+	} else {
+		// Reset away timer even if already away
+		u.awaySince = time.Now()
+	}
+}
+
+// GetAway returns if the user is away, when they went away, and the reason.
+func (u *User) GetAway() (bool, time.Time, string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.awayReason != "", u.awaySince, u.awayReason
 }
 
 func (u *User) Config() UserConfig {
@@ -121,7 +143,9 @@ func (u *User) setColorIdx(idx int) {
 func (u *User) Close() {
 	u.closeOnce.Do(func() {
 		if u.screen != nil {
-			u.screen.Close()
+			if err := u.screen.Close(); err != nil {
+				logger.Printf("Failed to close user %q screen: %s", u.ID(), err)
+			}
 		}
 		// close(u.msg) TODO: Close?
 		close(u.done)

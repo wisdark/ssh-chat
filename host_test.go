@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"errors"
+	"fmt"
 	"io"
 	mathRand "math/rand"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/shazow/ssh-chat/chat/message"
 	"github.com/shazow/ssh-chat/sshd"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/sync/errgroup"
 )
 
 func stripPrompt(s string) string {
@@ -89,13 +91,18 @@ func TestHostNameCollision(t *testing.T) {
 	}
 	defer s.Close()
 	host := NewHost(s, nil)
+
+	newUsers := make(chan *message.User)
+	host.OnUserJoined = func(u *message.User) {
+		newUsers <- u
+	}
 	go host.Serve()
 
-	done := make(chan struct{}, 1)
+	g := errgroup.Group{}
 
 	// First client
-	go func() {
-		err := sshd.ConnectShell(s.Addr().String(), "foo", func(r io.Reader, w io.WriteCloser) error {
+	g.Go(func() error {
+		return sshd.ConnectShell(s.Addr().String(), "foo", func(r io.Reader, w io.WriteCloser) error {
 			scanner := bufio.NewScanner(r)
 
 			// Consume the initial buffer
@@ -106,8 +113,8 @@ func TestHostNameCollision(t *testing.T) {
 				t.Errorf("Got %q; expected %q", actual, expected)
 			}
 
-			// Ready for second client
-			done <- struct{}{}
+			// wait for the second client
+			<-newUsers
 
 			scanner.Scan()
 			actual = scanner.Text()
@@ -122,39 +129,32 @@ func TestHostNameCollision(t *testing.T) {
 				t.Errorf("Got %q; expected %q", actual, expected)
 			}
 
-			// Wrap it up.
-			close(done)
 			return nil
 		})
-		if err != nil {
-			done <- struct{}{}
-			t.Fatal(err)
-		}
-	}()
-
-	// Wait for first client
-	<-done
+	})
 
 	// Second client
-	err = sshd.ConnectShell(s.Addr().String(), "foo", func(r io.Reader, w io.WriteCloser) error {
-		scanner := bufio.NewScanner(r)
+	g.Go(func() error {
+		// wait for the first client
+		<-newUsers
+		return sshd.ConnectShell(s.Addr().String(), "foo", func(r io.Reader, w io.WriteCloser) error {
+			scanner := bufio.NewScanner(r)
+			// Consume the initial buffer
+			scanner.Scan()
+			scanner.Scan()
+			scanner.Scan()
 
-		// Consume the initial buffer
-		scanner.Scan()
-		scanner.Scan()
-		scanner.Scan()
-
-		actual := scanner.Text()
-		if !strings.HasPrefix(actual, "[Guest1] ") {
-			t.Errorf("Second client did not get Guest1 name: %q", actual)
-		}
-		return nil
+			actual := scanner.Text()
+			if !strings.HasPrefix(actual, "[Guest1] ") {
+				t.Errorf("Second client did not get Guest1 name: %q", actual)
+			}
+			return nil
+		})
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	<-done
+	if err := g.Wait(); err != nil {
+		t.Error(err)
+	}
 }
 
 func TestHostWhitelist(t *testing.T) {
@@ -215,13 +215,13 @@ func TestHostKick(t *testing.T) {
 	host := NewHost(s, nil)
 	go host.Serve()
 
+	g := errgroup.Group{}
 	connected := make(chan struct{})
 	kicked := make(chan struct{})
-	done := make(chan struct{})
 
-	go func() {
+	g.Go(func() error {
 		// First client
-		err := sshd.ConnectShell(addr, "foo", func(r io.Reader, w io.WriteCloser) error {
+		return sshd.ConnectShell(addr, "foo", func(r io.Reader, w io.WriteCloser) error {
 			scanner := bufio.NewScanner(r)
 
 			// Consume the initial buffer
@@ -252,41 +252,116 @@ func TestHostKick(t *testing.T) {
 			}
 
 			kicked <- struct{}{}
-
 			return nil
 		})
-		if err != nil {
-			connected <- struct{}{}
-			close(connected)
-			t.Fatal(err)
-			close(done)
-		}
-	}()
+	})
 
-	go func() {
+	g.Go(func() error {
 		// Second client
-		err := sshd.ConnectShell(addr, "bar", func(r io.Reader, w io.WriteCloser) error {
+		return sshd.ConnectShell(addr, "bar", func(r io.Reader, w io.WriteCloser) error {
 			scanner := bufio.NewScanner(r)
 			<-connected
 			scanner.Scan()
 
 			<-kicked
 
-			if _, err := w.Write([]byte("am I still here?\r\n")); err != nil {
-				return err
+			if _, err := w.Write([]byte("am I still here?\r\n")); err != io.EOF {
+				return errors.New("expected to be kicked")
 			}
 
 			scanner.Scan()
-			return scanner.Err()
+			if err := scanner.Err(); err == io.EOF {
+				// All good, we got kicked.
+				return nil
+			} else {
+				return err
+			}
 		})
-		if err == io.EOF {
-			// All good, we got kicked.
-		} else if err != nil {
-			close(done)
+	})
+
+	if err := g.Wait(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestTimestampEnvConfig(t *testing.T) {
+	cases := []struct {
+		input      string
+		timeformat *string
+	}{
+		{"", strptr("15:04")},
+		{"1", strptr("15:04")},
+		{"0", nil},
+		{"time +8h", strptr("15:04")},
+		{"datetime +8h", strptr("2006-01-02 15:04:05")},
+	}
+	for _, tc := range cases {
+		u, err := connectUserWithConfig("dingus", map[string]string{
+			"SSHCHAT_TIMESTAMP": tc.input,
+		})
+		if err != nil {
 			t.Fatal(err)
 		}
-		close(done)
-	}()
+		userConfig := u.Config()
+		if userConfig.Timeformat != nil && tc.timeformat != nil {
+			if *userConfig.Timeformat != *tc.timeformat {
+				t.Fatal("unexpected timeformat:", *userConfig.Timeformat, "expected:", *tc.timeformat)
+			}
+		}
+	}
+}
 
-	<-done
+func strptr(s string) *string {
+	return &s
+}
+
+func connectUserWithConfig(name string, envConfig map[string]string) (*message.User, error) {
+	key, err := sshd.NewRandomSigner(512)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create signer: %w", err)
+	}
+	config := sshd.MakeNoAuth()
+	config.AddHostKey(key)
+
+	s, err := sshd.ListenSSH("localhost:0", config)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create a test server: %w", err)
+	}
+	defer s.Close()
+	host := NewHost(s, nil)
+
+	newUsers := make(chan *message.User)
+	host.OnUserJoined = func(u *message.User) {
+		newUsers <- u
+	}
+	go host.Serve()
+
+	clientConfig := sshd.NewClientConfig(name)
+	conn, err := ssh.Dial("tcp", s.Addr().String(), clientConfig)
+	if err != nil {
+		return nil, fmt.Errorf("unable to connect to test ssh-chat server: %w", err)
+	}
+	defer conn.Close()
+
+	session, err := conn.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("unable to open session: %w", err)
+	}
+	defer session.Close()
+
+	for key := range envConfig {
+		session.Setenv(key, envConfig[key])
+	}
+
+	err = session.Shell()
+	if err != nil {
+		return nil, fmt.Errorf("unable to open shell: %w", err)
+	}
+
+	for u := range newUsers {
+		if u.Name() == name {
+			return u, nil
+		}
+	}
+	return nil, fmt.Errorf("user %s not found in the host", name)
 }

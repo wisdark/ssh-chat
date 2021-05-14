@@ -49,6 +49,8 @@ type Host struct {
 
 	// GetMOTD is used to reload the motd from an external source
 	GetMOTD func() (string, error)
+	// OnUserJoined is used to notify when a user joins a host
+	OnUserJoined func(*message.User)
 }
 
 // NewHost creates a Host on top of an existing listener.
@@ -114,32 +116,6 @@ func (h *Host) Connect(term *sshd.Terminal) {
 	}
 
 	user.SetConfig(cfg)
-
-	// Load user config overrides from ENV
-	// TODO: Would be nice to skip the command parsing pipeline just to load
-	// config values. Would need to factor out some command handler logic into
-	// accessible helpers.
-	env := term.Env()
-	for _, e := range env {
-		switch e.Key {
-		case "SSHCHAT_TIMESTAMP":
-			if e.Value != "" && e.Value != "0" {
-				cmd := "/timestamp"
-				if e.Value != "1" {
-					cmd += " " + e.Value
-				}
-				if msg, ok := message.NewPublicMsg(cmd, user).ParseCommand(); ok {
-					h.Room.HandleMsg(msg)
-				}
-			}
-		case "SSHCHAT_THEME":
-			cmd := "/theme " + e.Value
-			if msg, ok := message.NewPublicMsg(cmd, user).ParseCommand(); ok {
-				h.Room.HandleMsg(msg)
-			}
-		}
-	}
-
 	go user.Consume()
 
 	// Close term once user is closed.
@@ -168,6 +144,31 @@ func (h *Host) Connect(term *sshd.Terminal) {
 		return
 	}
 
+	// Load user config overrides from ENV
+	// TODO: Would be nice to skip the command parsing pipeline just to load
+	// config values. Would need to factor out some command handler logic into
+	// accessible helpers.
+	env := term.Env()
+	for _, e := range env {
+		switch e.Key {
+		case "SSHCHAT_TIMESTAMP":
+			if e.Value != "" && e.Value != "0" {
+				cmd := "/timestamp"
+				if e.Value != "1" {
+					cmd += " " + e.Value
+				}
+				if msg, ok := message.NewPublicMsg(cmd, user).ParseCommand(); ok {
+					h.Room.HandleMsg(msg)
+				}
+			}
+		case "SSHCHAT_THEME":
+			cmd := "/theme " + e.Value
+			if msg, ok := message.NewPublicMsg(cmd, user).ParseCommand(); ok {
+				h.Room.HandleMsg(msg)
+			}
+		}
+	}
+
 	// Successfully joined.
 	if !apiMode {
 		term.SetPrompt(GetPrompt(user))
@@ -182,6 +183,10 @@ func (h *Host) Connect(term *sshd.Terminal) {
 	ratelimit := rateio.NewSimpleLimiter(3, time.Second*3)
 
 	logger.Debugf("[%s] Joined: %s", term.Conn.RemoteAddr(), user.Name())
+
+	if h.OnUserJoined != nil {
+		h.OnUserJoined(user)
+	}
 
 	for {
 		line, err := term.ReadLine()
@@ -334,6 +339,20 @@ func (h *Host) GetUser(name string) (*message.User, bool) {
 // InitCommands adds host-specific commands to a Commands container. These will
 // override any existing commands.
 func (h *Host) InitCommands(c *chat.Commands) {
+	sendPM := func(room *chat.Room, msg string, from *message.User, target *message.User) error {
+		m := message.NewPrivateMsg(msg, from, target)
+		room.Send(&m)
+
+		txt := fmt.Sprintf("[Sent PM to %s]", target.Name())
+		if isAway, _, awayReason := target.GetAway(); isAway {
+			txt += " Away: " + awayReason
+		}
+		sysMsg := message.NewSystemMsg(txt, from)
+		room.Send(sysMsg)
+		target.SetReplyTo(from)
+		return nil
+	}
+
 	c.Add(chat.Command{
 		Prefix:     "/msg",
 		PrefixHelp: "USER MESSAGE",
@@ -352,14 +371,7 @@ func (h *Host) InitCommands(c *chat.Commands) {
 				return errors.New("user not found")
 			}
 
-			m := message.NewPrivateMsg(strings.Join(args[1:], " "), msg.From(), target)
-			room.Send(&m)
-
-			txt := fmt.Sprintf("[Sent PM to %s]", target.Name())
-			ms := message.NewSystemMsg(txt, msg.From())
-			room.Send(ms)
-			target.SetReplyTo(msg.From())
-			return nil
+			return sendPM(room, strings.Join(args[1:], " "), msg.From(), target)
 		},
 	})
 
@@ -379,20 +391,12 @@ func (h *Host) InitCommands(c *chat.Commands) {
 				return errors.New("no message to reply to")
 			}
 
-			name := target.Name()
-			_, found := h.GetUser(name)
+			_, found := h.GetUser(target.ID())
 			if !found {
 				return errors.New("user not found")
 			}
 
-			m := message.NewPrivateMsg(strings.Join(args, " "), msg.From(), target)
-			room.Send(&m)
-
-			txt := fmt.Sprintf("[Sent PM to %s]", name)
-			ms := message.NewSystemMsg(txt, msg.From())
-			room.Send(ms)
-			target.SetReplyTo(msg.From())
-			return nil
+			return sendPM(room, strings.Join(args, " "), msg.From(), target)
 		},
 	})
 
@@ -416,7 +420,7 @@ func (h *Host) InitCommands(c *chat.Commands) {
 			case true:
 				whois = id.WhoisAdmin(room)
 			case false:
-				whois = id.Whois()
+				whois = id.Whois(room)
 			}
 			room.Send(message.NewSystemMsg(whois, msg.From()))
 
@@ -509,7 +513,7 @@ func (h *Host) InitCommands(c *chat.Commands) {
 			room.Send(message.NewAnnounceMsg(body))
 			target.Close()
 
-			logger.Debugf("Banned: \n-> %s", id.Whois())
+			logger.Debugf("Banned: \n-> %s", id.Whois(room))
 
 			return nil
 		},
